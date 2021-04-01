@@ -19,3 +19,4 @@
 package main
 
 import _ "github.com/containerd/containerd/pkg/cri"
+import _ "github.com/containerd/containerd/pkg/cri/criv1alpha2"
