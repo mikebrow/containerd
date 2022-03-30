@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/containerd"
@@ -59,6 +60,12 @@ func init() {
 // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
 // the sandbox is in ready state.
 func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+	var (
+		wg       sync.WaitGroup
+		netStart time.Time
+	)
+	rc := make(chan error)
+
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Sandbox config %+v", config)
 
@@ -125,7 +132,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}
 
 	if podNetwork {
-		netStart := time.Now()
+		netStart = time.Now()
 		// If it is not in host network namespace then create a namespace and set the sandbox
 		// handle. NetNSPath in sandbox metadata and NetNS is non empty only for non host network
 		// namespaces. If the pod is in host network namespace then both are empty and should not
@@ -163,10 +170,8 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		// In this case however caching the IP will add a subtle performance enhancement by avoiding
 		// calls to network namespace of the pod to query the IP of the veth interface on every
 		// SandboxStatus request.
-		if err := c.setupPodNetwork(ctx, &sandbox); err != nil {
-			return nil, fmt.Errorf("failed to setup network for sandbox %q: %w", id, err)
-		}
-		sandboxCreateNetworkTimer.UpdateSince(netStart)
+		wg.Add(1)
+		go c.setupPodNetwork(ctx, &sandbox, &wg, rc)
 	}
 
 	runtimeStart := time.Now()
@@ -355,6 +360,15 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 
 	sandboxRuntimeCreateTimer.WithValues(ociRuntime.Type).UpdateSince(runtimeStart)
 
+	if podNetwork {
+		err := <-rc
+		if err != nil {
+			return nil, fmt.Errorf("failed to setup network for sandbox %q: %w", id, err)
+		}
+		sandboxCreateNetworkTimer.UpdateSince(netStart)
+
+		wg.Wait()
+	}
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
@@ -374,7 +388,8 @@ func (c *criService) getNetworkPlugin(runtimeClass string) cni.CNI {
 }
 
 // setupPodNetwork setups up the network for a pod
-func (c *criService) setupPodNetwork(ctx context.Context, sandbox *sandboxstore.Sandbox) error {
+func (c *criService) setupPodNetwork(ctx context.Context, sandbox *sandboxstore.Sandbox, wg *sync.WaitGroup, rc chan error) {
+	defer wg.Done()
 	var (
 		id        = sandbox.ID
 		config    = sandbox.Config
@@ -382,26 +397,30 @@ func (c *criService) setupPodNetwork(ctx context.Context, sandbox *sandboxstore.
 		netPlugin = c.getNetworkPlugin(sandbox.RuntimeHandler)
 	)
 	if netPlugin == nil {
-		return errors.New("cni config not initialized")
+		rc <- errors.New("cni config not initialized")
+		return
 	}
 
 	opts, err := cniNamespaceOpts(id, config)
 	if err != nil {
-		return fmt.Errorf("get cni namespace options: %w", err)
+		rc <- fmt.Errorf("get cni namespace options: %w", err)
+		return
 	}
 	log.G(ctx).WithField("podsandboxid", id).Debugf("begin cni setup")
 	result, err := netPlugin.Setup(ctx, id, path, opts...)
 	if err != nil {
-		return err
+		rc <- err
+		return
 	}
 	logDebugCNIResult(ctx, id, result)
 	// Check if the default interface has IP config
 	if configs, ok := result.Interfaces[defaultIfName]; ok && len(configs.IPConfigs) > 0 {
 		sandbox.IP, sandbox.AdditionalIPs = selectPodIPs(ctx, configs.IPConfigs, c.config.IPPreference)
 		sandbox.CNIResult = result
-		return nil
+		rc <- nil
+		return
 	}
-	return fmt.Errorf("failed to find network info for sandbox %q", id)
+	rc <- fmt.Errorf("failed to find network info for sandbox %q", id)
 }
 
 // cniNamespaceOpts get CNI namespace options from sandbox config.
